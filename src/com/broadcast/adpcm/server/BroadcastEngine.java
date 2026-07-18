@@ -1,15 +1,18 @@
-package main.java.com.broadcast.adpcm.server;
+package com.broadcast.adpcm.server;
 
-import main.java.com.broadcast.adpcm.audio.AudioConfig;
-import main.java.com.broadcast.adpcm.audio.PCMConverter;
-import main.java.com.broadcast.adpcm.codec.G726Codec;
-import main.java.com.broadcast.adpcm.codec.G726State;
-import main.java.*;
-import main.java.com.broadcast.adpcm.network.packet.SimplePacketFormatter;
-import main.java.com.broadcast.adpcm.network.udp.UDPBroadcastSender;
-import main.java.com.broadcast.adpcm.util.AppLogger;
+import com.broadcast.adpcm.audio.AudioConfig;
+import com.broadcast.adpcm.audio.AudioSource;
+import com.broadcast.adpcm.audio.FileAudioSource;
+import com.broadcast.adpcm.audio.MicAudioSource;
+import com.broadcast.adpcm.audio.PCMConverter;
+import com.broadcast.adpcm.codec.AudioCodec;
+import com.broadcast.adpcm.codec.DPCMCodecAdapter;
+import com.broadcast.adpcm.codec.G726CodecAdapter;
+import com.broadcast.adpcm.network.packet.SimplePacketFormatter;
+import com.broadcast.adpcm.network.udp.UDPBroadcastSender;
+import com.broadcast.adpcm.util.AppLogger;
 
-import javax.sound.sampled.*;
+import javax.sound.sampled.LineUnavailableException;
 import java.io.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -17,43 +20,37 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * BroadcastEngine - Pipeline utama: ambil audio → encode → bungkus paket → kirim.
+ *
+ * Sumber audio (mic/file) dan algoritma kompresi (ADPCM G.726/DPCM) sekarang
+ * dipilih lewat ServerConfig, bukan hardcoded - lihat createAudioSource()
+ * dan createCodec() di bawah.
  */
 public final class BroadcastEngine {
 
-    // ==================== AUDIO FORMAT CONSTANTS ====================
-    private static final int TARGET_SAMPLE_RATE  = 8000;
-    private static final int TARGET_BIT_DEPTH    = 16;
-    private static final int TARGET_CHANNELS     = 1;
-    private static final boolean LITTLE_ENDIAN   = false; // false = little-endian di AudioFormat
-    private static final boolean SIGNED          = true;
-
     // Sync Tone Constants
-    private static final int SYNC_TONE_FREQUENCY  = 1000;  // 1000 Hz
-    private static final int SYNC_TONE_DURATION_MS = 200;  // 200 ms
-
-    // Network Constants
-    private static final int UDP_PORT = 50005;
+    private static final int SYNC_TONE_FREQUENCY   = 1000;  // 1000 Hz
+    private static final int SYNC_TONE_DURATION_MS = 200;   // 200 ms
 
     private final ServerConfig config;
     private final AudioConfig audioConfig;
     private final PCMConverter pcmConverter;
-    private final G726State encoderState;
+    private final AudioCodec codec;
     private final UDPBroadcastSender sender;
 
     // Threading components
-    // ✅ PERBAIKAN: ganti executorService (3 thread) → encodingExecutor (1 thread)
-    // Encoding HARUS sequential karena G726State tidak thread-safe
+    // ✅ Single thread executor — encoding HARUS sequential karena state codec
+    // (G726State/DPCMState) tidak thread-safe
     private ExecutorService encodingExecutor;
     private ScheduledExecutorService scheduledExecutor;
     private BlockingQueue<byte[]> packetQueue;
 
     // Audio capture
-    private TargetDataLine microphoneLine;
+    private AudioSource audioSource;
     private Thread captureThread;
 
     // Control flags
-    private final AtomicBoolean isRunning     = new AtomicBoolean(false);
-    private final AtomicBoolean isCapturing   = new AtomicBoolean(false);
+    private final AtomicBoolean isRunning      = new AtomicBoolean(false);
+    private final AtomicBoolean isCapturing    = new AtomicBoolean(false);
     private final AtomicInteger sequenceNumber = new AtomicInteger(0);
 
     // Statistics
@@ -74,18 +71,19 @@ public final class BroadcastEngine {
         this.config       = config;
         this.audioConfig  = config.getAudioConfig();
         this.pcmConverter = new PCMConverter(audioConfig);
-        this.encoderState = new G726State();
+        this.codec        = createCodec(config.getCodecType());
+        AppLogger.info("Codec aktif: " + codec.getName());
 
         try {
             if (config.isUseMulticast()) {
                 this.sender = new UDPBroadcastSender(
                     config.getMulticastAddress(),
-                    UDP_PORT,
+                    config.getUdpPort(),
                     null,
                     config.getTtl()
                 );
             } else {
-                this.sender = new UDPBroadcastSender(UDP_PORT);
+                this.sender = new UDPBroadcastSender(config.getUdpPort());
             }
         } catch (Exception e) {
             throw new IOException("Failed to initialize UDP sender", e);
@@ -104,6 +102,33 @@ public final class BroadcastEngine {
         }
     }
 
+    /**
+     * Factory codec berdasarkan pilihan di ServerConfig. Menambah algoritma
+     * baru cukup dengan menambah satu case di sini, tanpa mengubah logika
+     * pipeline lain di kelas ini.
+     */
+    private static AudioCodec createCodec(ServerConfig.CodecType type) {
+        switch (type) {
+            case DPCM:
+                return new DPCMCodecAdapter();
+            case ADPCM_G726:
+            default:
+                return new G726CodecAdapter();
+        }
+    }
+
+    /**
+     * Factory AudioSource berdasarkan pilihan di ServerConfig. FILE dipakai
+     * untuk pengujian terkontrol (input identik antar sesi - lihat diskusi
+     * Skenario A), MICROPHONE untuk broadcast/demo langsung.
+     */
+    private static AudioSource createAudioSource(ServerConfig config) {
+        if (config.getAudioSourceType() == ServerConfig.AudioSourceType.FILE) {
+            return new FileAudioSource(config.getAudioFilePath(), config.getAudioConfig());
+        }
+        return new MicAudioSource(config.getAudioConfig(), true); // true = little-endian
+    }
+
     // =========================================================================
     // START
     // =========================================================================
@@ -117,8 +142,7 @@ public final class BroadcastEngine {
         isRunning.set(true);
         startTime = System.currentTimeMillis();
 
-        // ✅ PERBAIKAN: Single thread executor — menjamin encoding sequential
-        // G726State tidak thread-safe, satu thread saja yang boleh akses encoderState
+        // ✅ Single thread executor — menjamin encoding sequential
         encodingExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "Audio-Encoder");
             t.setDaemon(true);
@@ -146,9 +170,9 @@ public final class BroadcastEngine {
         startStatsLogger();
 
         AppLogger.info("BroadcastEngine started successfully");
-        AppLogger.info("Audio format: " + TARGET_SAMPLE_RATE + " Hz, "
-            + TARGET_BIT_DEPTH + "-bit, " + TARGET_CHANNELS + " channel (PCM LINEAR)");
-        AppLogger.info("UDP port: " + UDP_PORT);
+        AppLogger.info("Audio format: " + audioConfig);
+        AppLogger.info("Codec: " + codec.getName());
+        AppLogger.info("UDP port: " + config.getUdpPort());
     }
 
     // =========================================================================
@@ -156,89 +180,21 @@ public final class BroadcastEngine {
     // =========================================================================
 
     private void startAudioCapture() throws LineUnavailableException {
-        AppLogger.info("Initializing audio capture...");
+        audioSource = createAudioSource(config);
 
-        AudioFormat format = new AudioFormat(
-            AudioFormat.Encoding.PCM_SIGNED,
-            TARGET_SAMPLE_RATE,
-            TARGET_BIT_DEPTH,
-            TARGET_CHANNELS,
-            TARGET_BIT_DEPTH / 8,
-            TARGET_SAMPLE_RATE,
-            LITTLE_ENDIAN   // ✅ false = little-endian
-        );
-
-        AppLogger.info("Requested audio format: " + format);
-        AppLogger.info("Encoding type: " + format.getEncoding());
-
-        if (format.getEncoding() != AudioFormat.Encoding.PCM_SIGNED &&
-            format.getEncoding() != AudioFormat.Encoding.PCM_UNSIGNED) {
-            String msg = "FATAL: Format encoding adalah " + format.getEncoding()
-                       + ", BUKAN PCM LINEAR!";
-            AppLogger.error(msg);
-            throw new LineUnavailableException(msg);
+        try {
+            audioSource.open();
+        } catch (IOException e) {
+            throw new LineUnavailableException("Gagal membuka sumber audio: " + e.getMessage());
         }
 
-        // ✅ PERBAIKAN: info diperbarui jika format berubah
-        DataLine.Info info = new DataLine.Info(TargetDataLine.class, format);
-
-        if (!AudioSystem.isLineSupported(info)) {
-            AppLogger.warn("Format tidak didukung langsung, mencari format kompatibel...");
-            format = findCompatibleFormat(info);
-            if (format == null) {
-                throw new LineUnavailableException("No compatible audio format found.");
-            }
-            info = new DataLine.Info(TargetDataLine.class, format); // ✅ info diperbarui
-            AppLogger.info("Menggunakan format kompatibel: " + format);
-        }
-
-        microphoneLine = (TargetDataLine) AudioSystem.getLine(info);
-        microphoneLine.open(format);
-        microphoneLine.start();
+        AppLogger.info("Sumber audio aktif: " + audioSource.getDescription());
 
         isCapturing.set(true);
 
         captureThread = new Thread(this::captureLoop, "Audio-Capture");
         captureThread.setDaemon(true);
         captureThread.start();
-
-        AppLogger.info("Audio capture started successfully!");
-        AppLogger.info("  - Encoding   : " + format.getEncoding());
-        AppLogger.info("  - Sample rate: " + format.getSampleRate() + " Hz");
-        AppLogger.info("  - Bit depth  : " + format.getSampleSizeInBits() + "-bit");
-        AppLogger.info("  - Channels   : " + format.getChannels());
-        AppLogger.info("  - Frame size : " + format.getFrameSize() + " bytes");
-        AppLogger.info("  - Little-endian: " + !format.isBigEndian());
-    }
-
-    private AudioFormat findCompatibleFormat(DataLine.Info preferredInfo) {
-        AudioFormat[] supportedFormats = preferredInfo.getFormats();
-        AudioFormat bestMatch = null;
-        int bestScore = -1;
-
-        for (AudioFormat fmt : supportedFormats) {
-            int score = 0;
-
-            if (fmt.getEncoding() == AudioFormat.Encoding.PCM_SIGNED)        score += 100;
-            else if (fmt.getEncoding() == AudioFormat.Encoding.PCM_UNSIGNED) score += 80;
-            else continue;
-
-            if (fmt.getSampleRate() == TARGET_SAMPLE_RATE)                   score += 50;
-            else if (fmt.getSampleRate() == 16000 || fmt.getSampleRate() == 44100) score += 20;
-
-            if (fmt.getSampleSizeInBits() == TARGET_BIT_DEPTH)               score += 40;
-            else if (fmt.getSampleSizeInBits() == 8)                         score += 10;
-
-            if (fmt.getChannels() == TARGET_CHANNELS)                        score += 30;
-
-            if (score > bestScore) {
-                bestScore = score;
-                bestMatch = fmt;
-            }
-        }
-
-        if (bestMatch != null) AppLogger.info("Found compatible format: " + bestMatch);
-        return bestMatch;
     }
 
     // =========================================================================
@@ -246,9 +202,10 @@ public final class BroadcastEngine {
     // =========================================================================
 
     private short[] generateSyncTone() {
-        int numSamples = (TARGET_SAMPLE_RATE * SYNC_TONE_DURATION_MS) / 1000;
+        int sampleRate  = audioConfig.getSampleRate();
+        int numSamples  = (sampleRate * SYNC_TONE_DURATION_MS) / 1000;
         short[] syncTone = new short[numSamples];
-        double angleStep = 2.0 * Math.PI * SYNC_TONE_FREQUENCY / TARGET_SAMPLE_RATE;
+        double angleStep = 2.0 * Math.PI * SYNC_TONE_FREQUENCY / sampleRate;
 
         for (int i = 0; i < numSamples; i++) {
             double sample = Math.sin(angleStep * i) * 20000.0;
@@ -277,7 +234,9 @@ public final class BroadcastEngine {
             AppLogger.info("Sync tone saved to PCM file: " + syncTonePCM.length + " samples");
         }
 
-        G726State syncState   = new G726State();
+        // Sync tone dienkode dengan instance codec terpisah (bukan `codec` utama)
+        // supaya state-nya tidak ikut tercampur ke sesi encoding audio sesungguhnya
+        AudioCodec syncCodec  = createCodec(config.getCodecType());
         int samplesPerFrame   = audioConfig.getSamplesPerFrame();
         int frames            = (syncTonePCM.length + samplesPerFrame - 1) / samplesPerFrame;
 
@@ -290,10 +249,10 @@ public final class BroadcastEngine {
             int adpcmOffset  = 0;
 
             for (int i = frameStart; i < frameEnd; i += 2) {
-                int adpcm1 = G726Codec.encode(syncTonePCM[i], syncState);
-                int adpcm2 = (i + 1 < frameEnd)
-                           ? G726Codec.encode(syncTonePCM[i + 1], syncState) : 0;
-                adpcmData[adpcmOffset++] = (byte) ((adpcm1 << 4) | (adpcm2 & 0x0F));
+                int code1 = syncCodec.encode(syncTonePCM[i]);
+                int code2 = (i + 1 < frameEnd)
+                          ? syncCodec.encode(syncTonePCM[i + 1]) : 0;
+                adpcmData[adpcmOffset++] = (byte) ((code1 << 4) | (code2 & 0x0F));
             }
 
             int seq            = sequenceNumber.getAndIncrement();
@@ -311,25 +270,33 @@ public final class BroadcastEngine {
     // CAPTURE LOOP
     // =========================================================================
 
-    /**
-     * ✅ PERBAIKAN: captureLoop submit ke encodingExecutor (single thread),
-     * bukan executorService (3 thread). Menjamin encoding sequential.
-     */
     private void captureLoop() {
         int frameSizeBytes = audioConfig.getBytesPerFrame();
-        byte[] buffer      = new byte[frameSizeBytes];
+        byte[] buffer       = new byte[frameSizeBytes];
 
         AppLogger.info("Capture loop started, frame size: " + frameSizeBytes + " bytes");
 
         while (isCapturing.get() && isRunning.get()) {
-            int bytesRead = microphoneLine.read(buffer, 0, buffer.length);
+            int bytesRead;
+            try {
+                bytesRead = audioSource.read(buffer);
+            } catch (IOException e) {
+                AppLogger.error("Error reading from audio source", e);
+                break;
+            }
+
+            if (bytesRead == -1) {
+                // Sumber finite (FileAudioSource) sudah habis - hentikan otomatis
+                AppLogger.info("Audio source reached end-of-stream, stopping capture");
+                break;
+            }
 
             if (bytesRead > 0) {
                 final byte[] audioChunk = new byte[bytesRead];
                 System.arraycopy(buffer, 0, audioChunk, 0, bytesRead);
 
                 // ✅ Single thread executor — encoding selalu sequential
-                // Tidak ada race condition pada encoderState
+                // Tidak ada race condition pada state codec
                 encodingExecutor.submit(() -> processAudioChunk(audioChunk));
             }
         }
@@ -344,7 +311,6 @@ public final class BroadcastEngine {
     private void processAudioChunk(byte[] audioChunk) {
         try {
             short[] pcmSamples = pcmConverter.toPcm16(audioChunk);
-            // pcmSamples         = pcmConverter.normalize(pcmSamples);
             // Sengaja TIDAK dipanggil: normalize() melakukan auto-gain per-chunk (~10ms)
             // yang akan mengangkat amplitudo chunk pelan mendekati skala penuh. Ini
             // menghapus perbedaan energi sinyal antar Variasi 1/2/3 (Tabel 3.2, khususnya
@@ -368,15 +334,21 @@ public final class BroadcastEngine {
                 int frameStart = f * audioConfig.getSamplesPerFrame();
                 for (int i = 0; i < audioConfig.getSamplesPerFrame(); i += 2) {
                     int sample1 = pcmSamples[frameStart + i];
-                    int adpcm1  = G726Codec.encode(sample1, encoderState);
+                    int code1   = codec.encode(sample1);
 
-                    int adpcm2 = 0;
+                    int code2 = 0;
                     if (i + 1 < audioConfig.getSamplesPerFrame()) {
                         int sample2 = pcmSamples[frameStart + i + 1];
-                        adpcm2      = G726Codec.encode(sample2, encoderState);
+                        code2       = codec.encode(sample2);
                     }
 
-                    adpcmData[adpcmOffset++] = (byte) ((adpcm1 << 4) | (adpcm2 & 0x0F));
+                    // Kode di-pack sebagai 2 nibble 4-bit per byte. Untuk DPCM
+                    // (signed, rentang [-8,7]), byte cast di akhir otomatis
+                    // membuang bit sign-extension di luar 8-bit rendah, sehingga
+                    // nibble tetap merepresentasikan two's complement 4-bit yang
+                    // benar tanpa masking tambahan. Decoder nanti WAJIB
+                    // sign-extend nibble saat membaca kode DPCM.
+                    adpcmData[adpcmOffset++] = (byte) ((code1 << 4) | (code2 & 0x0F));
                 }
             }
 
@@ -461,9 +433,9 @@ public final class BroadcastEngine {
     }
 
     private void printStats() {
-        long uptime  = System.currentTimeMillis() - startTime;
-        double fps   = (framesProcessed.get() * 1000.0) / uptime;
-        double pps   = (packetsSent.get() * 1000.0) / uptime;
+        long uptime = System.currentTimeMillis() - startTime;
+        double fps  = (framesProcessed.get() * 1000.0) / uptime;
+        double pps  = (packetsSent.get() * 1000.0) / uptime;
 
         AppLogger.info(String.format(
             "Stats: uptime=%ds, frames=%d (%.1f fps), packets=%d (%.1f pps), queue=%d",
@@ -476,10 +448,6 @@ public final class BroadcastEngine {
     // STOP
     // =========================================================================
 
-    /**
-     * ✅ PERBAIKAN: shutdown encodingExecutor (bukan executorService).
-     * Tunggu frame terakhir selesai di-encode sebelum menutup resource.
-     */
     public void stop() {
         if (!isRunning.get()) return;
 
@@ -487,9 +455,8 @@ public final class BroadcastEngine {
         isRunning.set(false);
         isCapturing.set(false);
 
-        if (microphoneLine != null) {
-            microphoneLine.stop();
-            microphoneLine.close();
+        if (audioSource != null) {
+            audioSource.close();
         }
 
         if (captureThread != null) {
@@ -512,7 +479,6 @@ public final class BroadcastEngine {
 
         sender.stop();
 
-        // ✅ PERBAIKAN: ambil size sebelum close
         try {
             if (pcmFileOut != null) {
                 pcmFileOut.flush();
@@ -536,8 +502,8 @@ public final class BroadcastEngine {
     // GETTERS
     // =========================================================================
 
-    public boolean isRunning()        { return isRunning.get();        }
-    public int getFramesProcessed()   { return framesProcessed.get();  }
-    public int getPacketsSent()       { return packetsSent.get();      }
-    public int getQueueSize()         { return packetQueue.size();     }
+    public boolean isRunning()      { return isRunning.get();       }
+    public int getFramesProcessed() { return framesProcessed.get(); }
+    public int getPacketsSent()     { return packetsSent.get();     }
+    public int getQueueSize()       { return packetQueue.size();    }
 }
