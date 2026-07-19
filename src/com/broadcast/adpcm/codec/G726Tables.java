@@ -1,5 +1,4 @@
-package main.java.com.broadcast.adpcm.codec;
-
+package com.broadcast.adpcm.codec;
 /**
  * G726Tables.java
  *

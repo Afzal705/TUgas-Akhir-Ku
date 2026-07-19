@@ -1,4 +1,4 @@
-package main.java.com.broadcast.adpcm.network.packet;
+package com.broadcast.adpcm.network.packet;
 
 /**
  * SimplePacketFormatter - Format paket sesuai spesifikasi skripsi:

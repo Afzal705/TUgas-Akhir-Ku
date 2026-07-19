@@ -1,4 +1,4 @@
-package main.java.com.broadcast.adpcm.util;
+package com.broadcast.adpcm.util;
 
 /**
  * ADPCMUtils - Utility perhitungan terkait ADPCM (bit ops, scaling, dll).

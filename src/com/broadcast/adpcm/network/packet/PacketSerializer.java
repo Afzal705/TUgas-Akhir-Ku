@@ -1,4 +1,4 @@
-package main.java.com.broadcast.adpcm.network.packet;
+package com.broadcast.adpcm.network.packet;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;

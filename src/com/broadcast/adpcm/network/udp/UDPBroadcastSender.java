@@ -1,4 +1,4 @@
-package main.java.com.broadcast.adpcm.network.udp;
+package com.broadcast.adpcm.network.udp;
 
 import java.io.IOException;
 import java.net.*;
