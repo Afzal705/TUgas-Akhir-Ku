@@ -1,4 +1,4 @@
-package main.java.com.broadcast.adpcm.util;
+package com.broadcast.adpcm.util;
 
 import java.io.*;
 import java.text.SimpleDateFormat;
