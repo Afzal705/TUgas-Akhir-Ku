@@ -54,8 +54,8 @@ public final class BroadcastServer {
             waitForShutdown();
             
         } catch (LineUnavailableException e) {
-            System.err.println("ERROR: Microphone not available or audio line in use");
-            System.err.println("Please check your microphone and audio settings");
+            System.err.println("ERROR: Gagal membuka sumber audio (mikrofon tidak tersedia/dipakai aplikasi lain, ATAU file audio tidak ditemukan)");
+            System.err.println("Detail: " + e.getMessage());
             e.printStackTrace();
             System.exit(2);
         } catch (IOException e) {
@@ -149,6 +149,27 @@ public final class BroadcastServer {
                     }
                     break;
                     
+                case "-c":
+                case "--codec":
+                    if (i + 1 < args.length) {
+                        String codecArg = args[++i].toLowerCase();
+                        if (codecArg.equals("dpcm")) {
+                            builder.codecType(ServerConfig.CodecType.DPCM);
+                        } else if (codecArg.equals("adpcm") || codecArg.equals("g726")) {
+                            builder.codecType(ServerConfig.CodecType.ADPCM_G726);
+                        } else {
+                            System.err.println("Unknown codec: " + codecArg + " (gunakan 'adpcm' atau 'dpcm')");
+                            return null;
+                        }
+                    }
+                    break;
+                    
+                case "--input-file":
+                    if (i + 1 < args.length) {
+                        builder.audioFilePath(args[++i]);
+                    }
+                    break;
+                    
                 case "-h":
                 case "--help":
                     return null;
@@ -169,10 +190,12 @@ public final class BroadcastServer {
         System.out.println("Usage: java -jar adpcm-server.jar [options]");
         System.out.println();
         System.out.println("Options:");
-        System.out.println("  -p, --port <port>           UDP port (default: 8888)");
+        System.out.println("  -p, --port <port>           UDP port (default: 50005)");
         System.out.println("  -m, --multicast [addr]      Use multicast mode (default: 239.1.2.3)");
-        System.out.println("  -b, --broadcast             Use broadcast mode");
+        System.out.println("  -b, --broadcast             Use broadcast mode (default)");
         System.out.println("  -u, --unicast               Use unicast mode (add clients via API)");
+        System.out.println("  -c, --codec <adpcm|dpcm>     Compression codec (default: adpcm)");
+        System.out.println("  --input-file <path>         Use PCM file as audio source instead of microphone");
         System.out.println("  -r, --samplerate <hz>       Sample rate (default: 8000)");
         System.out.println("  -f, --frame <ms>            Frame size in ms (default: 10)");
         System.out.println("  -i, --interval <ms>         Send interval in ms (default: 10)");
@@ -192,6 +215,12 @@ public final class BroadcastServer {
         System.out.println();
         System.out.println("  # Custom settings");
         System.out.println("  java -jar adpcm-server.jar -b -r 16000 -f 20 -v");
+        System.out.println();
+        System.out.println("  # DPCM sebagai metode pembanding (Sub-bab 3.3.3)");
+        System.out.println("  java -jar adpcm-server.jar -c dpcm");
+        System.out.println();
+        System.out.println("  # Pengujian terkontrol pakai file PCM, bukan mic (Skenario A)");
+        System.out.println("  java -jar adpcm-server.jar -c dpcm --input-file variasi1_take1.pcm");
         System.out.println();
         System.out.println("  # Debug with file output");
         System.out.println("  java -jar adpcm-server.jar --save-pcm output.raw --save-adpcm output.adpcm");
